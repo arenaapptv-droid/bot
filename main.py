@@ -21,13 +21,13 @@ import uvicorn
 import aiohttp
 
 # ═══════════════════════════════════════════
-# الإعدادات (تم تعديلها)
+# الإعدادات (تم تغيير المنفذ إلى 8080)
 # ═══════════════════════════════════════════
 BOT_TOKEN = "8260979666:AAHkg21xZmD5svkyswqu9ascEz1pJf2P0Kg"
 ADMIN_ID = 8266981888
 API_HOST = "127.0.0.1"
-API_PORT = 8000
-API_KEY = "CHANGE_THIS_SECRET_KEY"       # يفضل تغييره لاحقاً
+API_PORT = 8080                     # ← تغيير المنفذ إلى 8080
+API_KEY = "CHANGE_THIS_SECRET_KEY"  # يفضل تغييره لاحقاً
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
