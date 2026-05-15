@@ -3,6 +3,11 @@
 نظام بث متكامل - Telegram Bot + FastAPI + FFmpeg
 يدعم RTMP و HLS مع شعارات (من رابط URL، تغطية كاملة 16:9)
 مراقبة السيرفر الحية وتحديث حالة البث بشكل دوري
+جميع الأخطاء التي ظهرت سابقاً تم إصلاحها:
+- استخدام model_dump() بدلاً من dict() (Pydantic v2)
+- تسلسل LogoConfig إلى JSON بشكل صحيح
+- تجنب خطأ "message is not modified" في حلقة المراقبة
+- حفظ البيانات التلقائي يعمل
 """
 
 import asyncio
@@ -78,7 +83,7 @@ class StreamConfig(BaseModel):
     is_local_file: bool = False
 
 # ============================================
-# تخزين الحالة (بدون Redis)
+# تخزين الحالة (بدون Redis) مع حفظ تلقائي
 # ============================================
 class MemoryState:
     def __init__(self):
@@ -89,11 +94,28 @@ class MemoryState:
         self._load_backup()
         self._start_save_worker()
 
+    def _to_serializable(self, obj):
+        """تحويل الكائنات غير القابلة للتسلسل (مثل LogoConfig) إلى قاموس"""
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump()
+        if hasattr(obj, "dict"):
+            return obj.dict()
+        if isinstance(obj, dict):
+            return {k: self._to_serializable(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._to_serializable(i) for i in obj]
+        return obj
+
     def _load_backup(self):
         if os.path.exists("state_backup.json"):
             try:
                 with open("state_backup.json", "r") as f:
-                    self._data = json.load(f)
+                    raw = json.load(f)
+                # إعادة بناء الكائنات LogoConfig من القواميس
+                for key, value in raw.items():
+                    if key.startswith("stream:") and "logo" in value and isinstance(value["logo"], dict):
+                        value["logo"] = LogoConfig(**value["logo"])
+                    self._data[key] = value
                 logger.info("تم تحميل النسخة الاحتياطية")
             except Exception as e:
                 logger.error(f"خطأ في تحميل النسخة: {e}")
@@ -103,8 +125,9 @@ class MemoryState:
             while self._running:
                 time.sleep(30)
                 with self._lock:
+                    data_serializable = self._to_serializable(self._data)
                     with open("state_backup.json", "w") as f:
-                        json.dump(self._data, f, indent=2)
+                        json.dump(data_serializable, f, indent=2)
         self._save_thread = threading.Thread(target=save_loop, daemon=True)
         self._save_thread.start()
 
@@ -132,13 +155,14 @@ class MemoryState:
         for sid in stream_ids:
             data = await self.get(sid)
             if data:
+                # التحويل من قاموس إلى StreamConfig، مع LogoConfig المناسب
                 if "logo" in data and isinstance(data["logo"], dict):
                     data["logo"] = LogoConfig(**data["logo"])
                 streams[sid.replace("stream:", "")] = StreamConfig(**data)
         return streams
 
     async def save_stream(self, stream_id: str, config: StreamConfig):
-        await self.set(f"stream:{stream_id}", config.dict())
+        await self.set(f"stream:{stream_id}", config.model_dump())
 
     async def delete_stream(self, stream_id: str):
         await self.delete(f"stream:{stream_id}")
@@ -154,9 +178,11 @@ class MemoryState:
         self._running = False
         if self._save_thread:
             self._save_thread.join(timeout=5)
+        # حفظ نهائي
         with self._lock:
+            data_serializable = self._to_serializable(self._data)
             with open("state_backup.json", "w") as f:
-                json.dump(self._data, f, indent=2)
+                json.dump(data_serializable, f, indent=2)
 
 state = MemoryState()
 
@@ -334,7 +360,7 @@ async def create_stream(config: StreamConfig, _=Depends(verify_api_key)):
 @app.get("/streams")
 async def list_streams(_=Depends(verify_api_key)):
     streams = await state.get_all_streams()
-    return {"streams": {sid: cfg.dict() for sid, cfg in streams.items()}}
+    return {"streams": {sid: cfg.model_dump() for sid, cfg in streams.items()}}
 
 @app.get("/streams/{stream_id}")
 async def get_stream(stream_id: str, _=Depends(verify_api_key)):
@@ -458,6 +484,7 @@ async def api_request(method: str, endpoint: str, json_data: dict = None):
 monitor_tasks = {}
 
 async def live_monitor_loop(chat_id: int, message_id: int):
+    last_text = ""
     while True:
         try:
             stats_res = await api_request("GET", "/system/stats")
@@ -473,6 +500,10 @@ async def live_monitor_loop(chat_id: int, message_id: int):
                     f"💾 Disk: `{s.get('disk',0)}%` ({s.get('disk_used_gb',0)}/{s.get('disk_total_gb',0)} GB)\n"
                     f"🌐 Bandwidth المستخدمة: `{s.get('bandwidth_mb',0):.1f} MB`"
                 )
+            if text == last_text:
+                await asyncio.sleep(3)
+                continue
+            last_text = text
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⏹ إيقاف المراقبة", callback_data="stop_monitor")]
             ])
@@ -480,8 +511,10 @@ async def live_monitor_loop(chat_id: int, message_id: int):
                                         reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
             await asyncio.sleep(3)
         except Exception as e:
-            logger.error(f"خطأ في حلقة المراقبة: {e}")
-            break
+            # تجاهل خطأ "message is not modified" و أي أخطاء مؤقتة
+            if "message is not modified" not in str(e):
+                logger.error(f"خطأ في حلقة المراقبة: {e}")
+            await asyncio.sleep(3)
 
 @dp.message(lambda msg: msg.text == "📊 مراقبة السيرفر")
 async def start_server_monitor(message: types.Message):
@@ -525,7 +558,9 @@ async def start_cmd(message: types.Message):
     await message.reply(
         "🎬 *نظام إدارة البث المتقدم*\n\n"
         "يدعم RTMP و HLS مع شعارات (رابط صورة، تغطية كاملة 16:9).\n"
-        "استخدم الأزرار أدناه للتحكم.",
+        "استخدم الأزرار أدناه للتحكم.\n\n"
+        "لإضافة شعار: اختر تعديل قناة -> شعار (رابط) -> أرسل رابط الصورة.\n"
+        "سيتم تطبيق الشعار تلقائياً على الفيديو.",
         reply_markup=main_kb,
         parse_mode=ParseMode.MARKDOWN
     )
@@ -715,9 +750,10 @@ async def process_edit_value(message: types.Message):
                 return
         else:
             current["logo"] = {"enabled": False, "image_url": None, "full_overlay": True, "x": 0, "y": 0}
+        # تحديث مباشر
         res = await api_request("PUT", f"/streams/{sid}", json_data=current)
         if res.get("success"):
-            await message.reply("✅ تم تحديث الشعار")
+            await message.reply("✅ تم تحديث الشعار. إذا كان البث يعمل، سيتم إعادة تشغيله لتطبيق التغيير.")
         else:
             await message.reply("❌ فشل التحديث")
         del user_data[message.from_user.id]
