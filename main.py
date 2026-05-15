@@ -1,8 +1,4 @@
-#!/usr/bin/env python3
-"""
-نظام بث متكامل - يدعم RTMP و HLS مع شعارات (رابط صورة، تغطية كاملة)
-رابط HLS يعتمد على اسم القناة (slug) بدلاً من معرف عشوائي
-"""
+
 
 import asyncio
 import json
@@ -48,7 +44,7 @@ API_KEY = "CHANGE_THIS_SECRET_KEY_NOW"
 
 WORKER_POOL_SIZE = 5
 FFMPEG_PATH = "ffmpeg"
-HLS_BASE_URL = "http://164.68.102.28"   # عنوان VPS
+HLS_BASE_URL = "http://164.68.102.28"
 HLS_DIR = "/tmp/hls"
 os.makedirs(HLS_DIR, exist_ok=True)
 
@@ -92,8 +88,6 @@ class MemoryState:
     def _to_serializable(self, obj):
         if hasattr(obj, "model_dump"):
             return obj.model_dump()
-        if hasattr(obj, "dict"):
-            return obj.dict()
         if isinstance(obj, dict):
             return {k: self._to_serializable(v) for k, v in obj.items()}
         if isinstance(obj, list):
@@ -234,7 +228,6 @@ class FFmpegWorker:
         async with self._lock:
             self.active_workers -= 1
         await state.update_status(slug, {"status": "stopped", "pid": None})
-        # حذف ملفات HLS
         hls_path = os.path.join(HLS_DIR, slug)
         if os.path.exists(hls_path):
             shutil.rmtree(hls_path, ignore_errors=True)
@@ -303,14 +296,14 @@ class FFmpegWorker:
                 "-f", "hls", "-hls_time", "2", "-hls_list_size", "5",
                 "-hls_flags", "delete_segments+append_list", "-y", out_file
             ])
-        else:  # RTMP
+        else:
             cmd.extend(["-f", "flv", config.output_url])
         return cmd
 
 worker_manager = FFmpegWorker()
 
 # ============================================
-# FastAPI Backend + خدمة HLS
+# FastAPI Backend
 # ============================================
 app = FastAPI(title="Stream Manager API")
 app.add_middleware(
@@ -339,14 +332,12 @@ async def root():
 
 @app.post("/streams")
 async def create_stream(config: StreamConfig, _=Depends(verify_api_key)):
-    slug = config.slug
-    # التأكد من عدم وجود نفس slug
-    existing = await state.get(f"stream:{slug}")
+    existing = await state.get(f"stream:{config.slug}")
     if existing:
-        raise HTTPException(400, f"Slug '{slug}' already exists")
-    await state.save_stream(slug, config)
-    await state.update_status(slug, {"status": "stopped"})
-    return {"slug": slug, "hls_url": f"{HLS_BASE_URL}/live/{slug}/index.m3u8" if config.stream_type == "hls" else None}
+        raise HTTPException(400, f"Slug '{config.slug}' already exists")
+    await state.save_stream(config.slug, config)
+    await state.update_status(config.slug, {"status": "stopped"})
+    return {"slug": config.slug, "hls_url": f"{HLS_BASE_URL}/live/{config.slug}/index.m3u8" if config.stream_type == "hls" else None}
 
 @app.get("/streams")
 async def list_streams(_=Depends(verify_api_key)):
@@ -546,12 +537,17 @@ async def start_cmd(message: types.Message):
     await message.reply(
         "🎬 *نظام إدارة البث المتقدم*\n\n"
         "✅ يدعم RTMP و HLS.\n"
-        "✅ رابط HLS يكون بصيغة: `http://IP/live/اسم_القناة/index.m3u8`\n"
+        "✅ رابط HLS بصيغة: `http://164.68.102.28/live/اسم_القناة/index.m3u8`\n"
         "✅ إضافة شعارات عبر رابط صورة (تغطية كاملة 16:9).\n\n"
         "استخدم الأزرار أدناه.",
         reply_markup=main_kb,
         parse_mode=ParseMode.MARKDOWN
     )
+
+def slugify(name: str) -> str:
+    slug = re.sub(r'[^a-zA-Z0-9\u0600-\u06FF\s-]', '', name)
+    slug = re.sub(r'\s+', '-', slug.strip())
+    return slug.lower()
 
 @dp.message(lambda msg: msg.text == "📡 قائمة القنوات")
 async def list_channels(message: types.Message):
@@ -589,13 +585,6 @@ async def list_channels(message: types.Message):
         )
 
 # ---------- إضافة قناة جديدة ----------
-def slugify(name: str) -> str:
-    """تحويل الاسم إلى slug صالح للرابط"""
-    slug = re.sub(r'[^a-zA-Z0-9\u0600-\u06FF\s-]', '', name)
-    slug = re.sub(r'\s+', '-', slug.strip())
-    slug = slug.lower()
-    return slug
-
 @dp.message(lambda msg: msg.text == "➕ إضافة قناة")
 async def add_channel_start(message: types.Message):
     user_data[message.from_user.id] = {"step": "add_name"}
@@ -605,7 +594,7 @@ async def add_channel_start(message: types.Message):
 async def add_name_step(message: types.Message):
     name = message.text
     slug = slugify(name)
-    # التحقق من أن الاسم غير مكرر
+    # التحقق من عدم وجود نفس slug
     existing = await api_request("GET", f"/streams/{slug}")
     if "error" not in existing and existing.get("name"):
         await message.reply(f"⚠️ الاسم `{slug}` موجود مسبقاً. الرجاء استخدام اسم آخر.", parse_mode=ParseMode.MARKDOWN)
@@ -622,7 +611,6 @@ async def select_type(callback: types.CallbackQuery):
     stream_type = "rtmp" if callback.data == "type_rtmp" else "hls"
     user_data[callback.from_user.id]["stream_type"] = stream_type
     if stream_type == "hls":
-        # لا نطلب رابط إخراج
         user_data[callback.from_user.id]["step"] = "add_input"
         await callback.message.reply("📥 أرسل رابط المصدر (يمكن أن يكون URL أو مسار ملف محلي):")
     else:
@@ -636,7 +624,6 @@ async def add_input_step(message: types.Message):
     user_data[message.from_user.id]["input"] = input_url
     stream_type = user_data[message.from_user.id].get("stream_type")
     if stream_type == "hls":
-        # انتهى الإدخال، ننشئ القناة
         await create_stream_final(message)
     else:
         user_data[message.from_user.id]["step"] = "add_output"
@@ -681,8 +668,225 @@ async def create_stream_final(message: types.Message):
         await message.reply("❌ فشل إنشاء القناة: " + str(res))
     del user_data[message.from_user.id]
 
-# ---------- باقي دوال التعديل والحذف والتحكم (نفس السابق مع تغيير المفتاح إلى slug) ----------
-# (لن أكررها كلها هنا للاختصار، لكنها موجودة في الكود الكامل المرفق)
+# ---------- تعديل قناة ----------
+@dp.message(lambda msg: msg.text == "✏️ تعديل قناة")
+async def edit_channel_list(message: types.Message):
+    res = await api_request("GET", "/streams")
+    streams = res.get("streams", {})
+    if not streams:
+        await message.reply("لا توجد قنوات")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=cfg['name'], callback_data=f"edit_{slug}")] for slug, cfg in streams.items()
+    ])
+    await message.reply("اختر القناة لتعديلها:", reply_markup=kb)
+
+@dp.callback_query(lambda c: c.data.startswith("edit_"))
+async def edit_stream_cb(callback: types.CallbackQuery):
+    slug = callback.data.split("_")[1]
+    user_data[callback.from_user.id] = {"edit_slug": slug, "step": "choose_field"}
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏷️ الاسم", callback_data=f"field_name_{slug}"),
+         InlineKeyboardButton(text="📥 المصدر", callback_data=f"field_input_{slug}")],
+        [InlineKeyboardButton(text="📤 الإخراج RTMP", callback_data=f"field_output_{slug}"),
+         InlineKeyboardButton(text="⚙️ الجودة", callback_data=f"field_quality_{slug}")],
+        [InlineKeyboardButton(text="🖼️ شعار (رابط)", callback_data=f"field_logo_{slug}"),
+         InlineKeyboardButton(text="🔁 النوع (RTMP/HLS)", callback_data=f"field_type_{slug}")],
+        [InlineKeyboardButton(text="⏰ جدولة", callback_data=f"field_schedule_{slug}"),
+         InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel_edit")]
+    ])
+    await callback.message.reply("اختر الحقل لتعديله:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("field_"))
+async def edit_field_prompt(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    field = parts[1]
+    slug = parts[2]
+    user_data[callback.from_user.id] = {"edit_slug": slug, "edit_field": field}
+    prompts = {
+        "name": "🏷️ أرسل الاسم الجديد:",
+        "input": "📥 أرسل رابط المصدر الجديد:",
+        "output": "📤 أرسل رابط الإخراج RTMP الجديد:",
+        "quality": "⚙️ أرسل الجودة (low, medium, high):",
+        "type": "🔁 أرسل نوع البث (rtmp أو hls):",
+        "logo": "🖼️ أرسل رابط الصورة للتغطية الكاملة (http://...) أو 'none' لإلغاء الشعار.\nمثال: https://example.com/logo.png",
+        "schedule": "⏰ أرسل جدولة cron (مثال: 0 9 * * *) أو 'none':"
+    }
+    await callback.message.reply(prompts.get(field, "أرسل القيمة الجديدة:"))
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "cancel_edit")
+async def cancel_edit(callback: types.CallbackQuery):
+    if callback.from_user.id in user_data:
+        del user_data[callback.from_user.id]
+    await callback.message.reply("❌ تم إلغاء التعديل")
+    await callback.answer()
+
+@dp.message(lambda msg: msg.from_user.id in user_data and "edit_field" in user_data[msg.from_user.id])
+async def process_edit_value(message: types.Message):
+    data = user_data[message.from_user.id]
+    slug = data["edit_slug"]
+    field = data["edit_field"]
+    new_value = message.text.strip()
+    if new_value.lower() == "none":
+        new_value = None
+    current = await api_request("GET", f"/streams/{slug}")
+    if "error" in current:
+        await message.reply("❌ خطأ في جلب البيانات")
+        del user_data[message.from_user.id]
+        return
+    if field == "quality" and new_value not in ["low", "medium", "high"]:
+        await message.reply("❌ جودة غير صالحة. استخدم low, medium, high")
+        return
+    if field == "type" and new_value not in ["rtmp", "hls"]:
+        await message.reply("❌ نوع غير صالح. استخدم rtmp أو hls")
+        return
+    if field == "logo":
+        if new_value and new_value.lower() != "none":
+            if new_value.startswith(("http://", "https://")):
+                current["logo"] = {
+                    "enabled": True,
+                    "image_url": new_value,
+                    "full_overlay": True,
+                    "x": 0,
+                    "y": 0
+                }
+            else:
+                await message.reply("❌ الرابط غير صالح. يجب أن يبدأ بـ http:// أو https://")
+                return
+        else:
+            current["logo"] = {"enabled": False, "image_url": None, "full_overlay": True, "x": 0, "y": 0}
+        res = await api_request("PUT", f"/streams/{slug}", json_data=current)
+        if res.get("success"):
+            await message.reply("✅ تم تحديث الشعار. إذا كان البث يعمل، سيتم إعادة تشغيله لتطبيق التغيير.")
+        else:
+            await message.reply("❌ فشل التحديث")
+        del user_data[message.from_user.id]
+        return
+    # باقي الحقول
+    if field in current:
+        current[field] = new_value
+    res = await api_request("PUT", f"/streams/{slug}", json_data=current)
+    if res.get("success"):
+        await message.reply(f"✅ تم تحديث {field}")
+    else:
+        await message.reply("❌ فشل التحديث")
+    del user_data[message.from_user.id]
+
+# ---------- حذف قناة ----------
+@dp.message(lambda msg: msg.text == "❌ حذف قناة")
+async def delete_channel_list(message: types.Message):
+    res = await api_request("GET", "/streams")
+    streams = res.get("streams", {})
+    if not streams:
+        await message.reply("لا توجد قنوات")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=cfg['name'], callback_data=f"del_{slug}")] for slug, cfg in streams.items()
+    ])
+    await message.reply("اختر القناة لحذفها:", reply_markup=kb)
+
+@dp.callback_query(lambda c: c.data.startswith("del_"))
+async def delete_stream_cb(callback: types.CallbackQuery):
+    slug = callback.data.split("_")[1]
+    await api_request("DELETE", f"/streams/{slug}")
+    await callback.message.edit_text("🗑 تم حذف القناة")
+    await callback.answer()
+
+# ---------- أوامر التحكم بالبث ----------
+@dp.callback_query(lambda c: c.data.startswith("start_"))
+async def start_cb(callback: types.CallbackQuery):
+    slug = callback.data.split("_")[1]
+    await api_request("POST", f"/streams/{slug}/start")
+    await callback.answer("✅ تم طلب التشغيل", show_alert=True)
+
+@dp.callback_query(lambda c: c.data.startswith("stop_"))
+async def stop_cb(callback: types.CallbackQuery):
+    slug = callback.data.split("_")[1]
+    await api_request("POST", f"/streams/{slug}/stop")
+    await callback.answer("⏹️ تم طلب الإيقاف", show_alert=True)
+
+@dp.callback_query(lambda c: c.data.startswith("restart_"))
+async def restart_cb(callback: types.CallbackQuery):
+    slug = callback.data.split("_")[1]
+    await api_request("POST", f"/streams/{slug}/restart")
+    await callback.answer("🔄 تم طلب إعادة التشغيل", show_alert=True)
+
+@dp.callback_query(lambda c: c.data.startswith("refresh_"))
+async def refresh_status_cb(callback: types.CallbackQuery):
+    slug = callback.data.split("_")[1]
+    status_res = await api_request("GET", f"/streams/{slug}/status")
+    name = status_res.get("name", slug)
+    status = status_res.get("status", "unknown")
+    fps = status_res.get("fps", 0)
+    bitrate = status_res.get("bitrate", 0)
+    started_at = status_res.get("started_at")
+    uptime = ""
+    if started_at:
+        elapsed = time.time() - started_at
+        uptime = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+    text = (
+        f"🎬 *{name}*\n📛 المعرف: `{slug}`\n"
+        f"📡 الحالة: {status}\n"
+        f"🎬 FPS: {fps}\n"
+        f"📡 Bitrate: {bitrate} kbps\n"
+        f"⏱️ مدة التشغيل: {uptime}\n"
+        f"🆔 PID: {status_res.get('pid', '—')}"
+    )
+    await callback.message.edit_text(text, reply_markup=None, parse_mode=ParseMode.MARKDOWN)
+    await callback.answer("تم تحديث الحالة", show_alert=False)
+
+@dp.callback_query(lambda c: c.data.startswith("view_"))
+async def view_stream_cb(callback: types.CallbackQuery):
+    slug = callback.data.split("_")[1]
+    status_res = await api_request("GET", f"/streams/{slug}/status")
+    config_res = await api_request("GET", f"/streams/{slug}")
+    name = config_res.get("name", slug)
+    status = status_res.get("status", "unknown")
+    fps = status_res.get("fps", 0)
+    bitrate = status_res.get("bitrate", 0)
+    started_at = status_res.get("started_at")
+    uptime = ""
+    if started_at:
+        elapsed = time.time() - started_at
+        uptime = time.strftime("%H:%M:%S", time.gmtime(elapsed))
+    hls_link = ""
+    if config_res.get("stream_type") == "hls":
+        hls_link = f"\n🔗 {HLS_BASE_URL}/live/{slug}/index.m3u8"
+    text = (
+        f"🎬 *{name}*\n📛 المعرف: `{slug}`\n"
+        f"📡 الحالة: {status}\n"
+        f"🎬 FPS: {fps}\n"
+        f"📡 Bitrate: {bitrate} kbps\n"
+        f"⏱️ مدة التشغيل: {uptime}\n"
+        f"🆔 PID: {status_res.get('pid', '—')}{hls_link}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ تشغيل", callback_data=f"start_{slug}"),
+         InlineKeyboardButton(text="⏹️ إيقاف", callback_data=f"stop_{slug}")],
+        [InlineKeyboardButton(text="🔄 إعادة تشغيل", callback_data=f"restart_{slug}"),
+         InlineKeyboardButton(text="✏️ تعديل", callback_data=f"edit_{slug}"),
+         InlineKeyboardButton(text="📊 تحديث", callback_data=f"refresh_{slug}")],
+        [InlineKeyboardButton(text="🗑 حذف", callback_data=f"del_{slug}")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+    await callback.answer()
+
+# ---------- أوامر كلية ----------
+@dp.message(lambda msg: msg.text == "🔄 إعادة تشغيل الكل")
+async def restart_all(message: types.Message):
+    res = await api_request("GET", "/streams")
+    for slug in res.get("streams", {}):
+        await api_request("POST", f"/streams/{slug}/restart")
+    await message.reply("✅ تم طلب إعادة تشغيل جميع البثوث")
+
+@dp.message(lambda msg: msg.text == "⏹ إيقاف الكل")
+async def stop_all(message: types.Message):
+    res = await api_request("GET", "/streams")
+    for slug in res.get("streams", {}):
+        await api_request("POST", f"/streams/{slug}/stop")
+    await message.reply("✅ تم طلب إيقاف جميع البثوث")
 
 # ============================================
 # تشغيل الخدمات
@@ -715,3 +919,7 @@ if __name__ == "__main__":
         print("خطأ: ffmpeg غير مثبت.")
         exit(1)
     asyncio.run(main())
+EOF
+
+# 4. تشغيل البوت من جديد
+python3 main.py
