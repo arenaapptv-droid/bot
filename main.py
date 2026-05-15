@@ -919,7 +919,3 @@ if __name__ == "__main__":
         print("خطأ: ffmpeg غير مثبت.")
         exit(1)
     asyncio.run(main())
-EOF
-
-# 4. تشغيل البوت من جديد
-python3 main.py
